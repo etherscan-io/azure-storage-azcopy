@@ -77,7 +77,7 @@ func anyToRemote(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, sen
 		exists, existenceErr := s.RemoteFileExists()
 		if existenceErr != nil {
 			jptm.LogSendError(info.Source, info.Destination, "Could not check file existence. "+existenceErr.Error(), 0)
-			jptm.SetStatus(common.ETransferStatus.Failed()) // is a real failure, not just a FileAlreadyExists, in this case
+			jptm.SetStatus(common.ETransferStatus.Failed()) // is a real failure, not just a SkippedFileAlreadyExists, in this case
 			jptm.ReportTransferDone()
 			return
 		}
@@ -86,15 +86,16 @@ func anyToRemote(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, sen
 
 			// if necessary, prompt to confirm user's intent
 			if jptm.GetOverwriteOption() == common.EOverwriteOption.Prompt() {
-				// don't show the full URL, as it's too long and hard to read
+				// remove the SAS before prompting the user
 				parsed, _ := url.Parse(info.Destination)
-				shouldOverwrite = jptm.GetOverwritePrompter().shouldOverwrite(parsed.Path)
+				parsed.RawQuery = ""
+				shouldOverwrite = jptm.GetOverwritePrompter().shouldOverwrite(parsed.String())
 			}
 
 			if !shouldOverwrite {
 				// logging as Warning so that it turns up even in compact logs, and because previously we use Error here
 				jptm.LogAtLevelForCurrentTransfer(pipeline.LogWarning, "File already exists, so will be skipped")
-				jptm.SetStatus(common.ETransferStatus.FileAlreadyExistsFailure())
+				jptm.SetStatus(common.ETransferStatus.SkippedFileAlreadyExists())
 				jptm.ReportTransferDone()
 				return
 			}
@@ -308,13 +309,13 @@ func epilogueWithCleanupSendToRemote(jptm IJobPartTransferMgr, s ISenderBase, si
 	}
 
 	s.Epilogue() // Perform service-specific cleanup before jptm cleanup. Some services may actually require setup to make the file actually appear.
-	
+
 	if info.S2SDestLengthValidation {
 		if s2sc, isS2SCopier := s.(s2sCopier); isS2SCopier { // TODO: Implement this for upload and download?
 			destLength, err := s2sc.GetDestinationLength()
 
 			if err != nil {
-        jptm.FailActiveSend("S2S Length check: Get destination length", err)
+				jptm.FailActiveSend("S2S Length check: Get destination length", err)
 			}
 
 			if destLength != jptm.Info().SourceSize {
