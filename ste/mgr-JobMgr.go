@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/common"
@@ -69,6 +70,7 @@ type IJobMgr interface {
 	// TODO: added for debugging purpose. remove later
 	ActiveConnections() int64
 	GetPerfInfo() (displayStrings []string, constraint common.PerfConstraint)
+	TryGetPerformanceAdvice() []common.PerformanceAdvice
 	//Close()
 	getInMemoryTransitJobState() InMemoryTransitJobState      // get in memory transit job state saved in this job.
 	setInMemoryTransitJobState(state InMemoryTransitJobState) // set in memory transit job state saved in this job.
@@ -260,6 +262,22 @@ func (jm *jobMgr) logJobsAdminMessages() {
 			return
 		}
 	}
+}
+
+func (jm *jobMgr) TryGetPerformanceAdvice() []common.PerformanceAdvice {
+	ja := JobsAdmin.(*jobsAdmin)
+	if !ja.providePerfAdvice {
+		return make([]common.PerformanceAdvice, 0)
+	}
+
+	finalReason, finalConcurrency, timeOfFinalReason := ja.concurrencyTunerCoordinator.GetFinalState()
+
+	bytesTransferredAfterTuning := ja.BytesOverWire() - atomic.LoadInt64(&ja.atomicBytesTransferredWhileTuning)
+	secondsAfterTuning := time.Since(timeOfFinalReason).Seconds()
+	megabitsPerSec := (8 * float64(bytesTransferredAfterTuning) / secondsAfterTuning) / (1000 * 1000)
+
+	a := NewPerformanceAdvisor(jm.pipelineNetworkStats, ja.commandLineMbpsCap, int64(megabitsPerSec), finalReason, finalConcurrency)
+	return a.GetAdvice()
 }
 
 // initializeJobPartPlanInfo func initializes the JobPartPlanInfo handler for given JobPartOrder

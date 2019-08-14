@@ -106,7 +106,7 @@ var JobsAdmin interface {
 	CurrentMainPoolSize() int
 }
 
-func initJobsAdmin(appCtx context.Context, concurrency ConcurrencySettings, targetRateInMegaBitsPerSec int64, azcopyAppPathFolder string, azcopyLogPathFolder string) {
+func initJobsAdmin(appCtx context.Context, concurrency ConcurrencySettings, targetRateInMegaBitsPerSec int64, azcopyAppPathFolder string, azcopyLogPathFolder string, providePerfAdvice bool) {
 	if JobsAdmin != nil {
 		panic("initJobsAdmin was already called once")
 	}
@@ -149,16 +149,18 @@ func initJobsAdmin(appCtx context.Context, concurrency ConcurrencySettings, targ
 	}
 
 	ja := &jobsAdmin{
-		concurrency:      concurrency,
-		logger:           common.NewAppLogger(pipeline.LogInfo, azcopyLogPathFolder),
-		jobIDToJobMgr:    newJobIDToJobMgr(),
-		logDir:           azcopyLogPathFolder,
-		planDir:          planDir,
-		pacer:            pacer,
-		slicePool:        common.NewMultiSizeSlicePool(common.MaxBlockBlobBlockSize),
-		cacheLimiter:     common.NewCacheLimiter(maxRamBytesToUse),
-		fileCountLimiter: common.NewCacheLimiter(int64(concurrency.MaxOpenDownloadFiles)),
-		appCtx:           appCtx,
+		concurrency:        concurrency,
+		logger:             common.NewAppLogger(pipeline.LogInfo, azcopyLogPathFolder),
+		jobIDToJobMgr:      newJobIDToJobMgr(),
+		logDir:             azcopyLogPathFolder,
+		planDir:            planDir,
+		pacer:              pacer,
+		slicePool:          common.NewMultiSizeSlicePool(common.MaxBlockBlobBlockSize),
+		cacheLimiter:       common.NewCacheLimiter(maxRamBytesToUse),
+		fileCountLimiter:   common.NewCacheLimiter(int64(concurrency.MaxOpenDownloadFiles)),
+		appCtx:             appCtx,
+		commandLineMbpsCap: targetRateInMegaBitsPerSec,
+		providePerfAdvice:  providePerfAdvice,
 		coordinatorChannels: CoordinatorChannels{
 			partsChannel:     partsCh,
 			normalTransferCh: normalTransferCh,
@@ -267,10 +269,26 @@ func (ja *jobsAdmin) scheduleJobParts() {
 
 func (ja *jobsAdmin) createConcurrencyTuner() ConcurrencyTuner {
 	if ja.concurrency.AutoTuneMainPool() {
-		return NewAutoConcurrencyTuner(ja.concurrency.InitialMainPoolSize, ja.concurrency.MaxMainPoolSize.Value)
+		t := NewAutoConcurrencyTuner(ja.concurrency.InitialMainPoolSize, ja.concurrency.MaxMainPoolSize.Value)
+		if !t.(ConcurrencyTunerStatsCoordinator).RequestCallbackWhenStable(ja.recordTuningCompleted) {
+			panic("could not register tuning completion callback")
+		}
+		return t
 	} else {
 		return &nullConcurrencyTuner{fixedValue: ja.concurrency.InitialMainPoolSize}
 	}
+}
+
+func (ja *jobsAdmin) recordTuningCompleted() {
+	// remember how many bytes were transferred during tuning, so we can exclude them from our post-tuning throughput calculations
+	atomic.StoreInt64(&ja.atomicBytesTransferredWhileTuning, ja.BytesOverWire())
+
+	// Let the user know what we've done
+	msg := "Automatic concurrency tuning completed."
+	if ja.providePerfAdvice {
+		msg += " Recording of performance stats will begin now."
+	}
+	common.GetLifecycleMgr().Info(msg)
 }
 
 // worker that sizes the chunkProcessor pool, dynamically if necessary
@@ -322,7 +340,7 @@ func (ja *jobsAdmin) poolSizer(tuner ConcurrencyTuner) {
 						throughputMonitoringInterval = expandedMonitoringInterval // start averaging throughputs over longer time period if over 10 Gbps, since in some tests it takes a little longer to get a good average
 					}
 					targetConcurrency, reason = tuner.GetRecommendedConcurrency(int(megabitsPerSec))
-					if reason != concurrencyReasonNotActive {
+					if reason != concurrencyReasonFinished {
 						ja.LogToJobLog(fmt.Sprintf("Auto-adjusting concurrency level to %d for reason: %s", targetConcurrency, reason))
 					}
 				} else {
@@ -409,6 +427,7 @@ func (ja *jobsAdmin) transferProcessor(workerID int) {
 type jobsAdmin struct {
 	atomicSuccessfulBytesInActiveFiles int64
 	atomicCurrentMainPoolSize          int32
+	atomicBytesTransferredWhileTuning  int64
 	concurrency                        ConcurrencySettings
 	logger                             common.ILoggerCloser
 	jobIDToJobMgr                      jobIDToJobMgr // Thread-safe map from each JobID to its JobInfo
@@ -425,6 +444,8 @@ type jobsAdmin struct {
 	fileCountLimiter            common.CacheLimiter
 	workaroundJobLoggingChannel chan string
 	concurrencyTunerCoordinator ConcurrencyTunerStatsCoordinator
+	commandLineMbpsCap          int64
+	providePerfAdvice           bool
 }
 
 type CoordinatorChannels struct {
